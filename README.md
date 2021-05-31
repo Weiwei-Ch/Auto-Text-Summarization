@@ -1,4 +1,4 @@
-# Auto-Text-Summarization
+# Auto-Text-Summarization(未完，待续）
 
 文本摘要学习笔记和代码
 
