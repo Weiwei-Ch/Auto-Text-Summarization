@@ -7,8 +7,7 @@
 1.模型：基于transformer block的算法，代码可参见transformer.py、self_attention_encoder和self_attention_decoder.py文件；
 
 2.注意点：a.用到了Pointer-Generator Network，保证了输出内容来自输入内容，代码见decoding.py;
-
-         b.用的是lr schedules方法（动态lr);
+         b.用的是动态lr，见lr_schedules.py
          
 3.运用结果见‘模型结果截图’图片。
 
