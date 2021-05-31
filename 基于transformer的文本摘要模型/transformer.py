@@ -1,185 +1,217 @@
 import tensorflow as tf
-from src.pgn_transformer_tf2.layers.position import positional_encoding
-from src.utils.wv_loader import load_embedding_matrix
+from src.pgn_transformer_tf2.encoders.self_attention_encoder import EncoderLayer
+from src.pgn_transformer_tf2.decoders.self_attention_decoder import DecoderLayer
+from src.pgn_transformer_tf2.layers.transformer import Embedding, create_masks
+from src.pgn_transformer_tf2.utils.decoding import calc_final_dist
 
 
-def create_padding_mask(seq):
-    seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
+class Encoder(tf.keras.layers.Layer):
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, rate=0.1):
+        super(Encoder, self).__init__()
 
-    # 添加额外的维度来将填充加到
-    # 注意力对数（logits）。
-    return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.embedding = Embedding(input_vocab_size, d_model)
 
+        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate)
+                           for _ in range(num_layers)]
 
-def create_look_ahead_mask(size):
-    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
-    return mask  # (seq_len, seq_len)
+        self.dropout = tf.keras.layers.Dropout(rate)
 
+    def call(self, x, training, mask):
+        x = self.embedding(x)
+        x = self.dropout(x, training=training)
 
-"""
-create_look_ahead_mask
-    [[0., 1., 1., 1.],
-    [0., 0., 1., 1.],
-    [0., 0., 0., 1.],
-    [0., 0., 0., 0.]]
-"""
+        for i in range(self.num_layers):
+            x = self.enc_layers[i](x, training, mask)
 
-
-def scaled_dot_product_attention(q, k, v, mask):
-    """计算注意力权重。
-    q, k, v 必须具有匹配的前置维度。
-    k, v 必须有匹配的倒数第二个维度，例如：seq_len_k = seq_len_v。
-    虽然 mask 根据其类型（填充或前瞻）有不同的形状，
-    但是 mask 必须能进行广播转换以便求和。
-    
-    参数:
-        q: 请求的形状 == (..., seq_len_q, depth)
-        k: 主键的形状 == (..., seq_len_k, depth)
-        v: 数值的形状 == (..., seq_len_v, depth_v)
-        mask: Float 张量，其形状能转换成
-            (..., seq_len_q, seq_len_k)。默认为None。
-        
-    返回值:
-        输出，注意力权重
-    """
-
-    # ------------------------------------------------------------------------------
-    # 补全代码
-    # 使用 matmul 计算 q 和 k， 得到结果 matmul_qk
-    # 缩放 matmul_qk
-    # 使用根号 k 缩放 matmul_qk，注意要先对 k 值进行类型转换，得到 scaled_attention_logits
-    # ------------------------------------------------------------------------------
-    matmul_qk = tf.matmul(q, k, transpose_b=True)  # (..., seq_len_q, seq_len_k)
-    # 缩放 matmul_qk
-    dk = tf.cast(tf.shape(k)[-1], tf.float32)
-    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-    
-    # 将 mask 加入到缩放的张量上。
-    if mask is not None:
-        scaled_attention_logits += (mask * -1e9)
-
-    # ------------------------------------------------------------------------------
-    # 补全代码
-    # 对 scaled_attention_logits 做 softmax 操作，得到注意力权重 attention_weights
-    # 使用 attention_weights 对 v 做加权求和
-    # ------------------------------------------------------------------------------
-    
-    # softmax 在最后一个轴（seq_len_k）上归一化，因此分数相加等于1。
-    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # (..., seq_len_q, seq_len_k)
-
-    output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
-
-    return output, attention_weights
+        # (batch_size, input_seq_len, d_model)
+        return x
 
 
-class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
+class Decoder(tf.keras.layers.Layer):
+    def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size, rate=0.1):
+        super(Decoder, self).__init__()
+
+        self.d_model = d_model
+        self.num_layers = num_layers
         self.num_heads = num_heads
-        self.d_model = d_model
+        self.depth = self.d_model // self.num_heads
+        self.embedding = Embedding(target_vocab_size, d_model)
 
-        assert d_model % self.num_heads == 0
+        self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate) for _ in range(num_layers)]
+        self.dropout = tf.keras.layers.Dropout(rate)
 
-        self.depth = d_model // self.num_heads
+        # self.Wh = tf.keras.layers.Dense(1)
+        # self.Ws = tf.keras.layers.Dense(1)
+        # self.Wx = tf.keras.layers.Dense(1)
+        # self.V = tf.keras.layers.Dense(1)
+        # self.W_gen = tf.keras.layers.Dense(1)
 
-        self.wq = tf.keras.layers.Dense(d_model)
-        self.wk = tf.keras.layers.Dense(d_model)
-        self.wv = tf.keras.layers.Dense(d_model)
+    def call(self, x, enc_output, training,
+             look_ahead_mask, padding_mask):
+        attention_weights = {}
+        x = self.embedding(x)
+        out = self.dropout(x, training=training)
 
-        self.dense = tf.keras.layers.Dense(d_model)
+        for i in range(self.num_layers):
+            out, block1, block2 = self.dec_layers[i](out, enc_output, training,
+                                                     look_ahead_mask, padding_mask)
 
-    def split_heads(self, x, batch_size):
-        """分拆最后一个维度到 (num_heads, depth).
-        转置结果使得形状为 (batch_size, num_heads, seq_len, depth)
-        """
-        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
+            attention_weights['decoder_layer{}_block1'.format(i + 1)] = block1
+            attention_weights['decoder_layer{}_block2'.format(i + 1)] = block2
 
-    def call(self, v, k, q, mask):
-        batch_size = tf.shape(q)[0]
+        # x.shape == (batch_size, target_seq_len, d_model)
 
-        q = self.wq(q)  # (batch_size, seq_len, d_model)
-        k = self.wk(k)  # (batch_size, seq_len, d_model)
-        v = self.wv(v)  # (batch_size, seq_len, d_model)
-        # ----------------------------------------------------------------------------------------
-        # 补全代码
-        # 分别对 q、k、v 使用 self.split_heads 函数，分拆成多头
-        # 使用 scaled_dot_product_attention 函数计算注意力，得到 scaled_attention 和 attention_weights
-        # ----------------------------------------------------------------------------------------
-        q = split_heads(q, batch_size)  #(batch_size, num_heads, seq_len_q, depth)
-        k = split_heads(k, batch_size)
-        v = split_heads(v, batch_size)
-        
-        scaled_attention, attention_weights = scaled_dot_product_attention(q, k, v, mask) 
-        #scaled_attention: batch_size, num_heads, seq_len_q, depth
-        #attention_weights: batch_size,num_heads, seq_len_q, seq_len_k
+        # context vectors
+        enc_out_shape = tf.shape(enc_output)
+        context = tf.reshape(enc_output, (enc_out_shape[0], enc_out_shape[1], self.num_heads,
+                                          self.depth))  # shape : (batch_size, input_seq_len, num_heads, depth)
+        context = tf.transpose(context, [0, 2, 1, 3])  # (batch_size, num_heads, input_seq_len, depth)
+        context = tf.expand_dims(context, axis=2)  # (batch_size, num_heads, 1, input_seq_len, depth)
 
-        scaled_attention = tf.transpose(scaled_attention,
-                                        perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
+        attn = tf.expand_dims(block2, axis=-1)  # (batch_size, num_heads, target_seq_len, input_seq_len, 1)
+        context = context * attn  # (batch_size, num_heads, target_seq_len, input_seq_len, depth)
+        context = tf.reduce_sum(context, axis=3)  # (batch_size, num_heads, target_seq_len, depth)
+        context = tf.transpose(context, [0, 2, 1, 3])  # (batch_size, target_seq_len, num_heads, depth)
+        context = tf.reshape(context, (
+            tf.shape(context)[0], tf.shape(context)[1], self.d_model))  # (batch_size, target_seq_len, d_model)
 
-        concat_attention = tf.reshape(scaled_attention,
-                                      (batch_size, -1, self.d_model))  # (batch_size, seq_len_q, d_model)
-
-        output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
-
-        return output, attention_weights
-
-
-# class Embedding(tf.keras.layers.Layer):
-#
-#     def __init__(self, params):
-#         super(Embedding, self).__init__()
-#         self.d_model = params['d_model']
-#         embedding_matrix = load_embedding_matrix(max_vocab_size=params['vocab_size'])
-#         self.vocab_size, self.embedding_dim = embedding_matrix.shape
-#
-#         self.embedding = tf.keras.layers.Embedding(self.vocab_size, self.embedding_dim,
-#                                                    weights=[embedding_matrix], trainable=False)
-#         self.pos_encoding = positional_encoding(self.vocab_size, self.embedding_dim)
-#         self.fc = tf.keras.layers.Dense(self.d_model, activation='relu')
-#
-#     def call(self, x):
-#         embed_x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
-#         embed_x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-#         embed_x += self.pos_encoding[:, :tf.shape(x)[1], :]
-#         return self.fc(embed_x)
-
-class Embedding(tf.keras.layers.Layer):
-
-    def __init__(self, vocab_size, d_model):
-        super(Embedding, self).__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-
-        self.embedding = tf.keras.layers.Embedding(vocab_size, d_model)
-        self.pos_encoding = positional_encoding(vocab_size, d_model)
-
-    def call(self, x):
-        embed_x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
-        embed_x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        embed_x += self.pos_encoding[:, :tf.shape(x)[1], :]
-        return embed_x
+        # P_gens computing
+        # a = self.Wx(x)
+        # b = self.Ws(out)
+        # c = self.Wh(context)
+        # p_gens = tf.sigmoid(self.V(a + b + c))
+        # gen_state = tf.concat([x, out, context], axis=-1)
+        # p_gens = tf.sigmoid(self.W_gen(gen_state))
+        p_gens = None
+        # print('out is ', out)
+        # print('attention_weights is ', attention_weights)
+        # print('p_gens is ', p_gens)
+        return out, attention_weights, p_gens
 
 
-def create_masks(inp, tar):
-    # 编码器填充遮挡
-    enc_padding_mask = create_padding_mask(inp)
+class PGN_TRANSFORMER(tf.keras.Model):
+    def __init__(self, params):
+        super(PGN_TRANSFORMER, self).__init__()
 
-    # 在解码器的第二个注意力模块使用。
-    # 该填充遮挡用于遮挡编码器的输出。
-    dec_padding_mask = create_padding_mask(inp)
+        self.num_blocks = params["num_blocks"]
+        self.batch_size = params["batch_size"]
+        self.vocab_size = params["vocab_size"]
+        self.num_heads = params["num_heads"]
 
-    # 在解码器的第一个注意力模块使用。
-    # 用于填充（pad）和遮挡（mask）解码器获取到的输入的后续标记（future tokens）。
-    look_ahead_mask = create_look_ahead_mask(tf.shape(tar)[1])
-    dec_target_padding_mask = create_padding_mask(tar)
-    combined_mask = tf.maximum(dec_target_padding_mask, look_ahead_mask)
+        # self.embedding = Embedding(params["vocab_size"],
+        #                            params["d_model"])
+        self.encoder = Encoder(
+            params["num_blocks"],
+            params["d_model"],
+            params["num_heads"],
+            params["dff"],
+            params["vocab_size"],
+            params["dropout_rate"])
 
-    return enc_padding_mask, combined_mask, dec_padding_mask
+        self.decoder = Decoder(
+            params["num_blocks"],
+            params["d_model"],
+            params["num_heads"],
+            params["dff"],
+            params["vocab_size"],
+            params["dropout_rate"])
+
+        self.final_layer = tf.keras.layers.Dense(params["vocab_size"])
+
+    def call(self, inp, extended_inp, max_oov_len, tar, training, enc_padding_mask, look_ahead_mask, dec_padding_mask):
+        # print('inp is ', inp)
+        # embed_x = self.embedding(inp)
+        # embed_dec = self.embedding(tar)
+
+        enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, d_model)
+
+        # dec_output.shape == (batch_size, tar_seq_len, d_model)
+        dec_output, attention_weights, p_gens = self.decoder(tar,
+                                                             enc_output,
+                                                             training,
+                                                             look_ahead_mask,
+                                                             dec_padding_mask)
+        # print('dec_output is ', dec_output)
+        final_output = self.final_layer(dec_output)
+        # (batch_size, tar_seq_len, target_vocab_size)
+        final_output = tf.nn.softmax(final_output)
+
+        # print('final_output is ', final_output)
+        # p_gens = tf.keras.layers.Dense(tf.concat([before_dec, dec, attn_dists[-1]], axis=-1),units=1,activation=tf.sigmoid,trainable=training,use_bias=False)
+        attn_dists = attention_weights['decoder_layer{}_block2'.format(
+            self.num_blocks)]
+        # (batch_size,num_heads, targ_seq_len, inp_seq_len)
+        attn_dists = tf.reduce_sum(attn_dists, axis=1) / self.num_heads
+        # (batch_size, targ_seq_len, inp_seq_len)
+        # print('attn_dists is ', attn_dists)
+
+        # final_dists = calc_final_dist(extended_inp,
+        #                               tf.unstack(final_output, axis=1),
+        #                               tf.unstack(attn_dists, axis=1),
+        #                               tf.unstack(p_gens, axis=1),
+        #                               max_oov_len,
+        #                               self.vocab_size,
+        #                               self.batch_size)
+        #
+        # outputs = dict(logits=tf.stack(final_dists, 1), attentions=attn_dists)
+        outputs = dict(logits=final_output, attentions=attn_dists)
+        return outputs
 
 
 if __name__ == '__main__':
-    temp_mha = MultiHeadAttention(d_model=512, num_heads=8)
-    y = tf.random.uniform((1, 60, 512))  # (batch_size, encoder_sequence, d_model)
-    out, attn = temp_mha(y, k=y, q=y, mask=None)
-    print(out.shape, attn.shape)
+    sample_encoder = Encoder(num_layers=2, d_model=512, num_heads=8,
+                             dff=2048, input_vocab_size=8500)
+
+    embedding = Embedding(vocab_size=30000,
+                          d_model=512)
+    x = tf.random.uniform((64, 62), maxval=10, dtype=tf.int32)
+    enc_inp = embedding(x)
+
+    sample_encoder_output = sample_encoder(enc_inp,
+                                           training=False, mask=None)
+
+    # (batch_size, input_seq_len, d_model)
+    print(sample_encoder_output.shape)
+
+    sample_decoder = Decoder(num_layers=2, d_model=512, num_heads=8,
+                             dff=2048, target_vocab_size=8000)
+
+    y = tf.random.uniform((64, 26), maxval=10, dtype=tf.int32)
+    dec_inp = embedding(y)
+
+    output, attn, p_gens = sample_decoder(dec_inp,
+                                          enc_output=sample_encoder_output,
+                                          training=False, look_ahead_mask=None,
+                                          padding_mask=None)
+
+    print(output.shape, attn['decoder_layer2_block2'].shape)
+
+    params = {}
+    params["num_blocks"] = 2
+    params["d_model"] = 512
+    params["num_heads"] = 8
+    params["dff"] = 32
+    params["vocab_size"] = 30000
+    params["dropout_rate"] = 0.1
+    params["num_blocks"] = 2
+    params["batch_size"] = 64
+
+    enc_padding_mask, combined_mask, dec_padding_mask = create_masks(x, y)
+
+    print('enc_padding_mask:{},combined_mask:{},dec_padding_mask:{}'.format(enc_padding_mask.shape, combined_mask.shape,
+                                                                            dec_padding_mask.shape))
+
+    transformer = PGN_TRANSFORMER(params)
+
+    outputs = transformer(x,
+                          extended_inp=x,
+                          max_oov_len=0,
+                          tar=y,
+                          training=True,
+                          enc_padding_mask=enc_padding_mask,
+                          look_ahead_mask=combined_mask,
+                          dec_padding_mask=dec_padding_mask)
+
+    print(outputs)
